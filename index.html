@@ -17,13 +17,20 @@
 <script>
 // ---- Config ----
 const TILE = 32;
-const GRAVITY = 2400; // px/s^2
+const GRAVITY = 2400; // base px/s^2
 const MOVE_ACCEL = 2200; // px/s^2
 const MAX_MOVE_SPEED = 240; // px/s
 const FRICTION = 1400;
-const JUMP_SPEED = 720;
+const JUMP_SPEED = 700; // px/s (slightly tuned)
 const COYOTE_TIME = 0.08; // seconds you can still jump after leaving edge
 const JUMP_BUFFER = 0.08; // seconds jump input stored before landing
+
+// Jump feel tuning (variable gravity)
+const FALL_GRAVITY_MULT = 2.2;     // multiplies gravity when falling
+const LOW_JUMP_MULT = 2.8;         // multiplies gravity when rising but jump released (short hop)
+const APEX_GRAVITY_MULT = 0.7;     // reduces gravity near apex for a subtle hang
+const APEX_VY_THRESHOLD = 90;      // px/s; speed threshold to consider "near apex"
+const MAX_FALL_SPEED = 1200;       // cap terminal velocity
 
 // ---- Level (strings: '.' empty, '#' solid) ----
 const level = [
@@ -115,7 +122,7 @@ function moveAndCollide(entity, dt) {
 
   let collidedVert = false;
   for (let tx = leftTileV; tx <= rightTileV; tx++) {
-    if (entity.vy > 0) {
+    if (entity.vy > 0) { // falling
       if (tileAt(tx, bottomTileV) === '#') {
         entity.y = bottomTileV * TILE - entity.h;
         entity.vy = 0;
@@ -124,7 +131,7 @@ function moveAndCollide(entity, dt) {
         collidedVert = true;
         break;
       }
-    } else if (entity.vy < 0) {
+    } else if (entity.vy < 0) { // rising
       if (tileAt(tx, topTileV) === '#') {
         entity.y = (topTileV + 1) * TILE;
         entity.vy = 0;
@@ -148,7 +155,8 @@ function step() {
   // Input handling with smoothing
   const left = keys['arrowleft'] || keys['a'];
   const right = keys['arrowright'] || keys['d'];
-  const jumpPressed = keys[' '] || keys['space'] || keys['w'] || keys['arrowup'];
+  const jumpHeld = keys[' '] || keys['space'] || keys['w'] || keys['arrowup'];
+  const jumpPressed = jumpHeld; // current down state (we still use lastJumpPressTime for buffering)
 
   // record jump press time for buffering
   if (jumpPressed) player.lastJumpPressTime = now();
@@ -169,8 +177,27 @@ function step() {
   // clamp
   player.vx = Math.max(-MAX_MOVE_SPEED, Math.min(MAX_MOVE_SPEED, player.vx));
 
-  // Gravity
-  player.vy += GRAVITY * dt;
+  // Variable gravity for better jump feel
+  // Determine which gravity multiplier to use this frame
+  let gravityThisFrame = GRAVITY;
+
+  if (player.vy > 0) {
+    // falling: increase gravity for snappier fall
+    gravityThisFrame *= FALL_GRAVITY_MULT;
+  } else if (player.vy < 0 && !jumpHeld) {
+    // rising but jump was released: cut the jump by applying stronger gravity
+    gravityThisFrame *= LOW_JUMP_MULT;
+  } else {
+    // while rising and holding jump, allow a subtle apex hang near the top
+    if (Math.abs(player.vy) < APEX_VY_THRESHOLD && !player.onGround) {
+      gravityThisFrame *= APEX_GRAVITY_MULT;
+    }
+  }
+
+  // Apply gravity
+  player.vy += gravityThisFrame * dt;
+  // cap fall speed
+  if (player.vy > MAX_FALL_SPEED) player.vy = MAX_FALL_SPEED;
 
   // Jumping: coyote time & buffer
   const canJump = (player.onGround || (now() - player.lastGroundTime) <= COYOTE_TIME);
