@@ -231,14 +231,7 @@ function render() {
   ctx.fillRect(Math.round(px + 6), Math.round(py + 8), 4, 4);
   ctx.fillRect(Math.round(px + 14), Math.round(py + 8), 4, 4);
 
-  // Simple HUD
-  ctx.fillStyle = 'rgba(0,0,0,0.35)';
-  ctx.fillRect(8,8,200,56);
-  ctx.fillStyle = '#fff';
-  ctx.font = '12px monospace';
-  ctx.fillText('x:' + player.x.toFixed(1), 16, 26);
-  ctx.fillText('y:' + player.y.toFixed(1), 16, 42);
-  ctx.fillText('vx:' + player.vx.toFixed(1) + ' vy:' + player.vy.toFixed(1), 16, 58);
+  // (Coordinates HUD removed)
 }
 
 // ---- Start ----
