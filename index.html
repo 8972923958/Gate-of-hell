@@ -12,7 +12,7 @@
 </head>
 <body>
 <canvas id="game" width="960" height="540"></canvas>
-<div class="ui">Arrows / WASD to move — Space to jump</div>
+<div class="ui">Arrows / WASD to move — Space to jump — F1 toggles debug</div>
 
 <script>
 // ---- Config ----
@@ -21,16 +21,19 @@ const GRAVITY = 2400; // base px/s^2
 const MOVE_ACCEL = 2200; // px/s^2
 const MAX_MOVE_SPEED = 240; // px/s
 const FRICTION = 1400;
-const JUMP_SPEED = 700; // px/s (slightly tuned)
+const JUMP_SPEED = 700; // px/s
 const COYOTE_TIME = 0.08; // seconds you can still jump after leaving edge
 const JUMP_BUFFER = 0.08; // seconds jump input stored before landing
 
 // Jump feel tuning (variable gravity)
-const FALL_GRAVITY_MULT = 2.2;     // multiplies gravity when falling
-const LOW_JUMP_MULT = 2.8;         // multiplies gravity when rising but jump released (short hop)
-const APEX_GRAVITY_MULT = 0.7;     // reduces gravity near apex for a subtle hang
-const APEX_VY_THRESHOLD = 90;      // px/s; speed threshold to consider "near apex"
-const MAX_FALL_SPEED = 1200;       // cap terminal velocity
+const FALL_GRAVITY_MULT = 2.2;
+const LOW_JUMP_MULT = 2.8;
+const APEX_GRAVITY_MULT = 0.7;
+const APEX_VY_THRESHOLD = 90;
+const MAX_FALL_SPEED = 1200;
+
+// Physics substep
+const MAX_SUBSTEP = 1 / 120;
 
 // ---- Level (strings: '.' empty, '#' solid) ----
 const level = [
@@ -60,23 +63,31 @@ let camera = { x:0, y:0, w: canvas.width, h: canvas.height };
 // ---- Utility ----
 function now() { return performance.now() / 1000; }
 
-// ---- Input ----
-const keys = {};
-window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if ([" ","space"].includes(e.key.toLowerCase())) e.preventDefault(); });
-window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+// ---- Input (use event.code for consistency) ----
+const keys = {};            // current held state by code, e.g. "Space", "KeyA"
+const downThisFrame = {};   // one-shot down flags keyed by code
+let DEBUG = false;
+
+window.addEventListener('keydown', e => {
+  const code = e.code;
+  if (!keys[code]) downThisFrame[code] = true;
+  keys[code] = true;
+  if (code === 'Space') e.preventDefault(); // prevent page scroll
+  if (code === 'F1') { DEBUG = !DEBUG; e.preventDefault(); }
+});
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+});
 
 // ---- Tile map helpers ----
 const mapW = level[0].length;
 const mapH = level.length;
 
 function tileAt(tx, ty) {
-  if (tx < 0 || ty < 0 || tx >= mapW || ty >= mapH) return '#'; // out of bounds = solid
+  if (tx < 0 || ty < 0 || tx >= mapW || ty >= mapH) return '#';
   return level[ty][tx];
 }
 function worldToTile(x){ return Math.floor(x / TILE); }
-function rectIntersectsTile(ax,ay,aw,ah,tx,ty){
-  return !(ax+aw <= tx*TILE || ax >= (tx+1)*TILE || ay+ah <= ty*TILE || ay >= (ty+1)*TILE);
-}
 
 // ---- Player ----
 const player = {
@@ -87,7 +98,7 @@ const player = {
   lastJumpPressTime: -1e9,
 };
 
-// ---- Physics: sweep & resolve per-axis using tile checks ----
+// ---- Collision & movement ----
 function moveAndCollide(entity, dt) {
   // Horizontal
   entity.x += entity.vx * dt;
@@ -96,7 +107,6 @@ function moveAndCollide(entity, dt) {
   const topTile = worldToTile(entity.y);
   const bottomTile = worldToTile(entity.y + entity.h - 1);
 
-  // check horizontal collisions by scanning rows the entity occupies
   for (let ty = topTile; ty <= bottomTile; ty++) {
     if (entity.vx > 0) {
       if (tileAt(rightTile, ty) === '#') {
@@ -122,7 +132,7 @@ function moveAndCollide(entity, dt) {
 
   let collidedVert = false;
   for (let tx = leftTileV; tx <= rightTileV; tx++) {
-    if (entity.vy > 0) { // falling
+    if (entity.vy > 0) {
       if (tileAt(tx, bottomTileV) === '#') {
         entity.y = bottomTileV * TILE - entity.h;
         entity.vy = 0;
@@ -131,7 +141,7 @@ function moveAndCollide(entity, dt) {
         collidedVert = true;
         break;
       }
-    } else if (entity.vy < 0) { // rising
+    } else if (entity.vy < 0) {
       if (tileAt(tx, topTileV) === '#') {
         entity.y = (topTileV + 1) * TILE;
         entity.vy = 0;
@@ -140,86 +150,83 @@ function moveAndCollide(entity, dt) {
       }
     }
   }
-  if (!collidedVert) {
-    entity.onGround = false;
+  if (!collidedVert) entity.onGround = false;
+}
+
+// ---- Single physics update for a substep ----
+function physicsUpdate(dt, input) {
+  const left = input.left;
+  const right = input.right;
+  const jumpHeld = input.jumpHeld;
+
+  // Horizontal
+  if (left && !right) player.vx -= MOVE_ACCEL * dt;
+  else if (right && !left) player.vx += MOVE_ACCEL * dt;
+  else {
+    if (player.vx > 0) player.vx = Math.max(0, player.vx - FRICTION * dt);
+    else if (player.vx < 0) player.vx = Math.min(0, player.vx + FRICTION * dt);
   }
+  player.vx = Math.max(-MAX_MOVE_SPEED, Math.min(MAX_MOVE_SPEED, player.vx));
+
+  // Variable gravity
+  let gravityThisFrame = GRAVITY;
+  if (player.vy > 0) gravityThisFrame *= FALL_GRAVITY_MULT;
+  else if (player.vy < 0 && !jumpHeld) gravityThisFrame *= LOW_JUMP_MULT;
+  else if (Math.abs(player.vy) < APEX_VY_THRESHOLD && !player.onGround) gravityThisFrame *= APEX_GRAVITY_MULT;
+
+  player.vy += gravityThisFrame * dt;
+  if (player.vy > MAX_FALL_SPEED) player.vy = MAX_FALL_SPEED;
+
+  // Jumping: record buffer handled in main loop; check here
+  const canJump = (player.onGround || (now() - player.lastGroundTime) <= COYOTE_TIME);
+  const bufferedJump = (now() - player.lastJumpPressTime) <= JUMP_BUFFER;
+  if (bufferedJump && canJump) {
+    player.vy = -JUMP_SPEED;
+    player.onGround = false;
+    player.lastJumpPressTime = -1e9;
+  }
+
+  moveAndCollide(player, dt);
 }
 
 // ---- Game loop ----
 let last = now();
 function step() {
   const t = now();
-  const dt = Math.min(1/30, t - last); // clamp large dt
+  let dt = t - last;
   last = t;
+  dt = Math.min(0.1, dt);
 
-  // Input handling with smoothing
-  const left = keys['arrowleft'] || keys['a'];
-  const right = keys['arrowright'] || keys['d'];
-  const jumpHeld = keys[' '] || keys['space'] || keys['w'] || keys['arrowup'];
-  const jumpPressed = jumpHeld; // current down state (we still use lastJumpPressTime for buffering)
+  // Input snapshot using event.code keys
+  const input = {
+    left: keys['ArrowLeft'] || keys['KeyA'],
+    right: keys['ArrowRight'] || keys['KeyD'],
+    jumpHeld: keys['Space'] || keys['KeyW'] || keys['ArrowUp']
+  };
 
-  // record jump press time for buffering
-  if (jumpPressed) player.lastJumpPressTime = now();
-
-  // Horizontal acceleration
-  if (left && !right) {
-    player.vx -= MOVE_ACCEL * dt;
-  } else if (right && !left) {
-    player.vx += MOVE_ACCEL * dt;
-  } else {
-    // apply friction toward 0
-    if (player.vx > 0) {
-      player.vx = Math.max(0, player.vx - FRICTION * dt);
-    } else if (player.vx < 0) {
-      player.vx = Math.min(0, player.vx + FRICTION * dt);
-    }
-  }
-  // clamp
-  player.vx = Math.max(-MAX_MOVE_SPEED, Math.min(MAX_MOVE_SPEED, player.vx));
-
-  // Variable gravity for better jump feel
-  // Determine which gravity multiplier to use this frame
-  let gravityThisFrame = GRAVITY;
-
-  if (player.vy > 0) {
-    // falling: increase gravity for snappier fall
-    gravityThisFrame *= FALL_GRAVITY_MULT;
-  } else if (player.vy < 0 && !jumpHeld) {
-    // rising but jump was released: cut the jump by applying stronger gravity
-    gravityThisFrame *= LOW_JUMP_MULT;
-  } else {
-    // while rising and holding jump, allow a subtle apex hang near the top
-    if (Math.abs(player.vy) < APEX_VY_THRESHOLD && !player.onGround) {
-      gravityThisFrame *= APEX_GRAVITY_MULT;
-    }
+  // Record jump presses on down transition
+  if (downThisFrame['Space'] || downThisFrame['KeyW'] || downThisFrame['ArrowUp']) {
+    player.lastJumpPressTime = now();
   }
 
-  // Apply gravity
-  player.vy += gravityThisFrame * dt;
-  // cap fall speed
-  if (player.vy > MAX_FALL_SPEED) player.vy = MAX_FALL_SPEED;
+  // clear downThisFrame entries
+  for (const k in downThisFrame) delete downThisFrame[k];
 
-  // Jumping: coyote time & buffer
-  const canJump = (player.onGround || (now() - player.lastGroundTime) <= COYOTE_TIME);
-  const bufferedJump = (now() - player.lastJumpPressTime) <= JUMP_BUFFER;
-  if (bufferedJump && canJump) {
-    player.vy = -JUMP_SPEED;
-    player.onGround = false;
-    player.lastJumpPressTime = -1e9; // consume buffer
+  // Integrate in substeps
+  let remaining = dt;
+  while (remaining > 0) {
+    const stepDt = Math.min(remaining, MAX_SUBSTEP);
+    physicsUpdate(stepDt, input);
+    remaining -= stepDt;
   }
 
-  // Move & collide
-  moveAndCollide(player, dt);
-
-  // Camera follow (center player horizontally, a little above vertically)
+  // Camera follow
   camera.x = player.x + player.w/2 - camera.w/2;
   camera.y = player.y + player.h/2 - camera.h/2 - 40;
-  // clamp camera to level bounds
   camera.x = Math.max(0, Math.min(camera.x, mapW * TILE - camera.w));
   camera.y = Math.max(0, Math.min(camera.y, mapH * TILE - camera.h));
 
   render();
-
   requestAnimationFrame(step);
 }
 
@@ -227,7 +234,6 @@ function step() {
 function render() {
   ctx.clearRect(0,0,canvas.width,canvas.height);
 
-  // Background sky already set by CSS; draw tiles
   const startCol = Math.floor(camera.x / TILE);
   const endCol = Math.floor((camera.x + camera.w) / TILE);
   const startRow = Math.floor(camera.y / TILE);
@@ -239,7 +245,6 @@ function render() {
       if (ch === '#') {
         const sx = col * TILE - camera.x;
         const sy = row * TILE - camera.y;
-        // draw block with shading
         ctx.fillStyle = '#6b6b6b';
         ctx.fillRect(Math.round(sx), Math.round(sy), TILE, TILE);
         ctx.fillStyle = '#7f7f7f';
@@ -253,17 +258,26 @@ function render() {
   const py = player.y - camera.y;
   ctx.fillStyle = '#ffdd57';
   ctx.fillRect(Math.round(px), Math.round(py), player.w, player.h);
-  // eyes
   ctx.fillStyle = '#111';
   ctx.fillRect(Math.round(px + 6), Math.round(py + 8), 4, 4);
   ctx.fillRect(Math.round(px + 14), Math.round(py + 8), 4, 4);
 
-  // (Coordinates HUD removed)
+  // Debug overlay
+  if (DEBUG) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(8, 8, 240, 88);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.fillText('onGround: ' + player.onGround, 16, 26);
+    ctx.fillText('vy: ' + player.vy.toFixed(1), 16, 44);
+    ctx.fillText('vx: ' + player.vx.toFixed(1), 16, 62);
+    ctx.fillText('time since ground: ' + (now() - player.lastGroundTime).toFixed(3), 16, 80);
+    ctx.fillText('buffered: ' + ((now() - player.lastJumpPressTime) <= JUMP_BUFFER), 16, 98);
+  }
 }
 
 // ---- Start ----
 requestAnimationFrame(step);
-
 </script>
 </body>
 </html>
