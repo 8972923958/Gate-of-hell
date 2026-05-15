@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Minimal Platformer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  html,body { height:100%; margin:0; background:#222; display:flex; align-items:center; justify-content:center; }
+  canvas { image-rendering:pixelated; border:4px solid #111; background:#78c0ff; }
+  .ui { position:fixed; top:8px; left:8px; color:#fff; font-family:monospace; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div class="ui">Arrows / WASD to move — Space to jump</div>
+
+<script>
+// ---- Config ----
+const TILE = 32;
+const GRAVITY = 2400; // px/s^2
+const MOVE_ACCEL = 2200; // px/s^2
+const MAX_MOVE_SPEED = 240; // px/s
+const FRICTION = 1400;
+const JUMP_SPEED = 720;
+const COYOTE_TIME = 0.08; // seconds you can still jump after leaving edge
+const JUMP_BUFFER = 0.08; // seconds jump input stored before landing
+
+// ---- Level (strings: '.' empty, '#' solid) ----
+const level = [
+  "........................................................",
+  "........................................................",
+  "........................................................",
+  "..............###.......................................",
+  "........................................................",
+  ".........##.............................................",
+  "........................................................",
+  ".........................####...........................",
+  "........................................................",
+  "..............##........................................",
+  "........................................................",
+  "############################......###########...........",
+  "........................................................",
+  "........................................................",
+  "........................................................",
+  "........................................................",
+];
+
+// ---- Canvas & Camera ----
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let camera = { x:0, y:0, w: canvas.width, h: canvas.height };
+
+// ---- Utility ----
+function now() { return performance.now() / 1000; }
+
+// ---- Input ----
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if ([" ","space"].includes(e.key.toLowerCase())) e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+// ---- Tile map helpers ----
+const mapW = level[0].length;
+const mapH = level.length;
+
+function tileAt(tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= mapW || ty >= mapH) return '#'; // out of bounds = solid
+  return level[ty][tx];
+}
+function worldToTile(x){ return Math.floor(x / TILE); }
+function rectIntersectsTile(ax,ay,aw,ah,tx,ty){
+  return !(ax+aw <= tx*TILE || ax >= (tx+1)*TILE || ay+ah <= ty*TILE || ay >= (ty+1)*TILE);
+}
+
+// ---- Player ----
+const player = {
+  x: 80, y: 80, w: 24, h: 30,
+  vx: 0, vy: 0,
+  onGround: false,
+  lastGroundTime: -1e9,
+  lastJumpPressTime: -1e9,
+};
+
+// ---- Physics: sweep & resolve per-axis using tile checks ----
+function moveAndCollide(entity, dt) {
+  // Horizontal
+  entity.x += entity.vx * dt;
+  const leftTile = worldToTile(entity.x);
+  const rightTile = worldToTile(entity.x + entity.w - 1);
+  const topTile = worldToTile(entity.y);
+  const bottomTile = worldToTile(entity.y + entity.h - 1);
+
+  // check horizontal collisions by scanning rows the entity occupies
+  for (let ty = topTile; ty <= bottomTile; ty++) {
+    if (entity.vx > 0) {
+      if (tileAt(rightTile, ty) === '#') {
+        entity.x = rightTile * TILE - entity.w;
+        entity.vx = 0;
+        break;
+      }
+    } else if (entity.vx < 0) {
+      if (tileAt(leftTile, ty) === '#') {
+        entity.x = (leftTile + 1) * TILE;
+        entity.vx = 0;
+        break;
+      }
+    }
+  }
+
+  // Vertical
+  entity.y += entity.vy * dt;
+  const leftTileV = worldToTile(entity.x);
+  const rightTileV = worldToTile(entity.x + entity.w - 1);
+  const topTileV = worldToTile(entity.y);
+  const bottomTileV = worldToTile(entity.y + entity.h - 1);
+
+  let collidedVert = false;
+  for (let tx = leftTileV; tx <= rightTileV; tx++) {
+    if (entity.vy > 0) {
+      if (tileAt(tx, bottomTileV) === '#') {
+        entity.y = bottomTileV * TILE - entity.h;
+        entity.vy = 0;
+        entity.onGround = true;
+        entity.lastGroundTime = now();
+        collidedVert = true;
+        break;
+      }
+    } else if (entity.vy < 0) {
+      if (tileAt(tx, topTileV) === '#') {
+        entity.y = (topTileV + 1) * TILE;
+        entity.vy = 0;
+        collidedVert = true;
+        break;
+      }
+    }
+  }
+  if (!collidedVert) {
+    entity.onGround = false;
+  }
+}
+
+// ---- Game loop ----
+let last = now();
+function step() {
+  const t = now();
+  const dt = Math.min(1/30, t - last); // clamp large dt
+  last = t;
+
+  // Input handling with smoothing
+  const left = keys['arrowleft'] || keys['a'];
+  const right = keys['arrowright'] || keys['d'];
+  const jumpPressed = keys[' '] || keys['space'] || keys['w'] || keys['arrowup'];
+
+  // record jump press time for buffering
+  if (jumpPressed) player.lastJumpPressTime = now();
+
+  // Horizontal acceleration
+  if (left && !right) {
+    player.vx -= MOVE_ACCEL * dt;
+  } else if (right && !left) {
+    player.vx += MOVE_ACCEL * dt;
+  } else {
+    // apply friction toward 0
+    if (player.vx > 0) {
+      player.vx = Math.max(0, player.vx - FRICTION * dt);
+    } else if (player.vx < 0) {
+      player.vx = Math.min(0, player.vx + FRICTION * dt);
+    }
+  }
+  // clamp
+  player.vx = Math.max(-MAX_MOVE_SPEED, Math.min(MAX_MOVE_SPEED, player.vx));
+
+  // Gravity
+  player.vy += GRAVITY * dt;
+
+  // Jumping: coyote time & buffer
+  const canJump = (player.onGround || (now() - player.lastGroundTime) <= COYOTE_TIME);
+  const bufferedJump = (now() - player.lastJumpPressTime) <= JUMP_BUFFER;
+  if (bufferedJump && canJump) {
+    player.vy = -JUMP_SPEED;
+    player.onGround = false;
+    player.lastJumpPressTime = -1e9; // consume buffer
+  }
+
+  // Move & collide
+  moveAndCollide(player, dt);
+
+  // Camera follow (center player horizontally, a little above vertically)
+  camera.x = player.x + player.w/2 - camera.w/2;
+  camera.y = player.y + player.h/2 - camera.h/2 - 40;
+  // clamp camera to level bounds
+  camera.x = Math.max(0, Math.min(camera.x, mapW * TILE - camera.w));
+  camera.y = Math.max(0, Math.min(camera.y, mapH * TILE - camera.h));
+
+  render();
+
+  requestAnimationFrame(step);
+}
+
+// ---- Rendering ----
+function render() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // Background sky already set by CSS; draw tiles
+  const startCol = Math.floor(camera.x / TILE);
+  const endCol = Math.floor((camera.x + camera.w) / TILE);
+  const startRow = Math.floor(camera.y / TILE);
+  const endRow = Math.floor((camera.y + camera.h) / TILE);
+
+  for (let row = startRow; row <= endRow; row++) {
+    for (let col = startCol; col <= endCol; col++) {
+      const ch = tileAt(col, row);
+      if (ch === '#') {
+        const sx = col * TILE - camera.x;
+        const sy = row * TILE - camera.y;
+        // draw block with shading
+        ctx.fillStyle = '#6b6b6b';
+        ctx.fillRect(Math.round(sx), Math.round(sy), TILE, TILE);
+        ctx.fillStyle = '#7f7f7f';
+        ctx.fillRect(Math.round(sx)+2, Math.round(sy)+2, TILE-4, TILE-4);
+      }
+    }
+  }
+
+  // Draw player
+  const px = player.x - camera.x;
+  const py = player.y - camera.y;
+  ctx.fillStyle = '#ffdd57';
+  ctx.fillRect(Math.round(px), Math.round(py), player.w, player.h);
+  // eyes
+  ctx.fillStyle = '#111';
+  ctx.fillRect(Math.round(px + 6), Math.round(py + 8), 4, 4);
+  ctx.fillRect(Math.round(px + 14), Math.round(py + 8), 4, 4);
+
+  // Simple HUD
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(8,8,200,56);
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px monospace';
+  ctx.fillText('x:' + player.x.toFixed(1), 16, 26);
+  ctx.fillText('y:' + player.y.toFixed(1), 16, 42);
+  ctx.fillText('vx:' + player.vx.toFixed(1) + ' vy:' + player.vy.toFixed(1), 16, 58);
+}
+
+// ---- Start ----
+requestAnimationFrame(step);
+
+</script>
+</body>
+</html>
